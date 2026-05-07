@@ -143,6 +143,15 @@ def train():
     print(f"device={device}  fp16={config.fp16}  cudnn_benchmark={config.cuda_benchmark}")
 
     loader = build_dataloader(config, split="train")
+
+    stats = loader.dataset.score_stats()
+    print(
+        f"dataset: total={stats['total']}  "
+        f"spe={stats['n_spe']} ({100-stats['cpe_pct']}%)  "
+        f"cpe={stats['n_cpe']} ({stats['cpe_pct']}%)  "
+        f"score_median={stats['median']}  score_p95={stats['p95']}"
+    )
+
     steps_per_epoch = len(loader) // config.grad_accum
     total_steps     = steps_per_epoch * config.max_epochs
     print(f"steps_per_epoch={steps_per_epoch}  total_steps={total_steps}")
@@ -167,19 +176,23 @@ def train():
         print("torch.compile: done")
 
     model.train()
-    step         = start_step
-    data_iter    = iter(loader)
-    running_loss = 0.0
-    running_gnorm = 0.0
-    tokens_seen  = 0
-    t0           = time.perf_counter()
+    step              = start_step
+    data_iter         = iter(loader)
+    running_loss      = 0.0
+    running_lm_loss   = 0.0
+    running_len_loss  = 0.0
+    running_gnorm     = 0.0
+    tokens_seen       = 0
+    t0                = time.perf_counter()
 
     pbar = tqdm(total=total_steps, initial=start_step, desc="train", dynamic_ncols=True)
 
     while step < total_steps:
         optimizer.zero_grad(set_to_none=True)
-        accum_loss   = 0.0
-        batch_tokens = 0
+        accum_loss     = 0.0
+        accum_lm_loss  = 0.0
+        accum_len_loss = 0.0
+        batch_tokens   = 0
 
         for _ in range(config.grad_accum):
             try:
@@ -191,6 +204,7 @@ def train():
             input_ids      = batch["input_ids"].to(device)
             labels         = batch["labels"].to(device)
             attention_mask = batch["attention_mask"].to(device)
+            true_len       = batch["true_len"].to(device)
             batch_tokens  += attention_mask.sum().item()
 
             with torch.cuda.amp.autocast(enabled=(config.fp16 and device.type == "cuda")):
@@ -205,11 +219,18 @@ def train():
                     else contextlib.nullcontext()
                 )
                 with _sdp_ctx:
-                    loss = model(input_ids, attention_mask=attention_mask, labels=labels)
+                    loss, lm_loss, len_loss = model(
+                        input_ids,
+                        attention_mask=attention_mask,
+                        labels=labels,
+                        true_len=true_len,
+                    )
                     loss = loss / config.grad_accum
 
             scaler.scale(loss).backward()
-            accum_loss += loss.item()
+            accum_loss     += loss.item()
+            accum_lm_loss  += lm_loss.item() / config.grad_accum
+            accum_len_loss += len_loss.item() / config.grad_accum
 
         scaler.unscale_(optimizer)
         grad_norm = nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm).item()
@@ -217,29 +238,38 @@ def train():
         scaler.update()
         scheduler.step()
 
-        step          += 1
-        running_loss  += accum_loss
-        running_gnorm += grad_norm
-        tokens_seen   += batch_tokens
+        step             += 1
+        running_loss     += accum_loss
+        running_lm_loss  += accum_lm_loss
+        running_len_loss += accum_len_loss
+        running_gnorm    += grad_norm
+        tokens_seen      += batch_tokens
 
         pbar.update(1)
 
         if step % config.log_every_n_steps == 0:
             elapsed     = time.perf_counter() - t0
             tok_per_sec = tokens_seen / elapsed if elapsed > 0 else 0
-            avg_loss    = running_loss  / config.log_every_n_steps
-            avg_gnorm   = running_gnorm / config.log_every_n_steps
+            n           = config.log_every_n_steps
+            avg_loss    = running_loss     / n
+            avg_lm      = running_lm_loss  / n
+            avg_len     = running_len_loss / n
+            avg_gnorm   = running_gnorm    / n
             lr_now      = scheduler.get_last_lr()[0]
-            pbar.set_postfix(loss=f"{avg_loss:.4f}", gnorm=f"{avg_gnorm:.3f}",
-                             lr=f"{lr_now:.2e}", tok_s=f"{tok_per_sec:,.0f}")
-            tqdm.write(
-                f"step={step:>7d}  loss={avg_loss:.4f}  gnorm={avg_gnorm:.3f}"
-                f"  lr={lr_now:.2e}  tok/s={tok_per_sec:,.0f}"
+            pbar.set_postfix(
+                loss=f"{avg_loss:.4f}", lm=f"{avg_lm:.4f}", len=f"{avg_len:.4f}",
+                gnorm=f"{avg_gnorm:.3f}", lr=f"{lr_now:.2e}", tok_s=f"{tok_per_sec:,.0f}",
             )
-            running_loss  = 0.0
-            running_gnorm = 0.0
-            tokens_seen   = 0
-            t0            = time.perf_counter()
+            tqdm.write(
+                f"step={step:>7d}  loss={avg_loss:.4f}  lm={avg_lm:.4f}  len={avg_len:.4f}"
+                f"  gnorm={avg_gnorm:.3f}  lr={lr_now:.2e}  tok/s={tok_per_sec:,.0f}"
+            )
+            running_loss     = 0.0
+            running_lm_loss  = 0.0
+            running_len_loss = 0.0
+            running_gnorm    = 0.0
+            tokens_seen      = 0
+            t0               = time.perf_counter()
 
         if step % config.save_every_n_steps == 0:
             _save_checkpoint(model, optimizer, scheduler, config, step, accum_loss, save_dir)

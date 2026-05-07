@@ -139,6 +139,30 @@ class FFN(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.dropout(self.fc2(F.gelu(self.fc1(x))))
 
+
+class LengthAwareModule(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(
+            config.d_model, config.n_heads,
+            dropout=config.dropout, batch_first=True, bias=False,
+        )
+        self.norm = nn.LayerNorm(config.d_model)
+        self.mlp  = nn.Sequential(
+            nn.Linear(config.d_model, config.d_model // 2),
+            nn.GELU(),
+            nn.Linear(config.d_model // 2, 1),
+        )
+        self.len_proj = nn.Linear(1, config.d_model)
+
+    def forward(self, encoder_out: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        x, _ = self.attn(encoder_out, encoder_out, encoder_out)
+        x    = self.norm(x + encoder_out)
+        x    = x.mean(dim=1)
+        pred_len = self.mlp(x)
+        len_emb  = self.len_proj(pred_len)
+        return pred_len.squeeze(-1), len_emb
+
 class DecoderLayer(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -176,8 +200,9 @@ class DecoderLM(nn.Module):
         self.layers   = nn.ModuleList([DecoderLayer(config) for _ in range(config.n_layers)])
         self.norm_out = nn.LayerNorm(config.d_model)
         self.lm_head  = nn.Linear(config.d_model, config.vocab_size, bias=False)
-
         self.lm_head.weight = self.token_embed.weight
+
+        self.lam = LengthAwareModule(config)
 
         head_dim = config.d_model // config.n_heads
         freqs    = _build_rope_freqs(head_dim, config.max_seq_len)
@@ -196,32 +221,44 @@ class DecoderLM(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids:      torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         encoder_output: Optional[torch.Tensor] = None,
-        labels: Optional[torch.Tensor] = None,
+        labels:         Optional[torch.Tensor] = None,
+        true_len:       Optional[torch.Tensor] = None,
     ):
         B, T = input_ids.shape
+        freqs = self.rope_freqs[:T]
 
         x = self.embed_drop(self.token_embed(input_ids))
 
-        freqs = self.rope_freqs[:T]
+        if encoder_output is not None:
+            pred_len, len_emb = self.lam(encoder_output)
+            x = x + len_emb.unsqueeze(1)
+        else:
+            pred_len = None
 
         for layer in self.layers:
             x = layer(x, freqs=freqs, attention_mask=attention_mask, encoder_output=encoder_output)
 
-        x      = self.norm_out(x)
-        logits = self.lm_head(x)
+        logits = self.lm_head(self.norm_out(x))
 
         if labels is None:
             return logits
 
-        loss = F.cross_entropy(
+        lm_loss = F.cross_entropy(
             logits.view(-1, self.config.vocab_size),
             labels.view(-1),
             ignore_index=-100,
+            label_smoothing=getattr(self.config, "label_smoothing", 0.1),
         )
-        return loss
+
+        if pred_len is not None and true_len is not None:
+            len_loss = F.smooth_l1_loss(pred_len, true_len)
+            lam_lambda = getattr(self.config, "lam_lambda", 0.1)
+            return lm_loss + lam_lambda * len_loss, lm_loss, len_loss
+
+        return lm_loss, lm_loss, torch.zeros(1, device=input_ids.device)
 
     def num_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)

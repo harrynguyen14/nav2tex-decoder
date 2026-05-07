@@ -1,5 +1,6 @@
 import glob
 import random
+import re
 from typing import Iterator
 
 import torch
@@ -9,9 +10,22 @@ from transformers import NougatTokenizerFast
 
 from normalize import normalize
 
+_CPE_PATTERNS = re.compile(
+    r'\\(frac|int|sum|prod|matrix|pmatrix|bmatrix|cases|align|begin|sqrt'
+    r'|underbrace|overbrace|overset|underset|substack|bigoplus|bigotimes'
+    r'|lim|sup|inf|max|min)\b'
+)
+
+def _complexity_score(s: str) -> float:
+    char_len   = len(s)
+    cmd_count  = len(_CPE_PATTERNS.findall(s))
+    nest_depth = s.count('{')
+    return char_len + cmd_count * 15 + nest_depth * 10
+
+
 class LaTeXDataset(Dataset):
     def __init__(self, config):
-        self.config = config
+        self.config    = config
         self.tokenizer = NougatTokenizerFast.from_pretrained(config.tokenizer_dir)
 
         files = sorted(glob.glob(config.data_glob))
@@ -24,14 +38,14 @@ class LaTeXDataset(Dataset):
             rows.extend(table["latex"].to_pylist())
 
         self.samples = [r for r in rows if r and isinstance(r, str) and r.strip()]
-        self._lengths = [len(s) for s in self.samples]
+        self._scores = [_complexity_score(s) for s in self.samples]
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> dict:
         text = normalize(self.samples[idx])
-        ids = self.tokenizer.encode(text, add_special_tokens=False, truncation=False)
+        ids  = self.tokenizer.encode(text, add_special_tokens=False, truncation=False)
 
         max_tokens = self.config.max_seq_len - 1
         ids = ids[:max_tokens]
@@ -42,13 +56,31 @@ class LaTeXDataset(Dataset):
         return {
             "input_ids": torch.tensor(input_ids, dtype=torch.long),
             "labels":    torch.tensor(labels,    dtype=torch.long),
+            "true_len":  torch.tensor(len(ids),  dtype=torch.float),
         }
 
     def normal_indices(self) -> list[int]:
-        return [i for i, l in enumerate(self._lengths) if l <= self.config.cpe_char_threshold]
+        t = self.config.cpe_score_threshold
+        return [i for i, sc in enumerate(self._scores) if sc <= t]
 
     def cpe_indices(self) -> list[int]:
-        return [i for i, l in enumerate(self._lengths) if l > self.config.cpe_char_threshold]
+        t = self.config.cpe_score_threshold
+        return [i for i, sc in enumerate(self._scores) if sc > t]
+
+    def score_stats(self) -> dict:
+        import statistics
+        scores = self._scores
+        thresh = self.config.cpe_score_threshold
+        n_cpe  = sum(1 for sc in scores if sc > thresh)
+        return {
+            "total":   len(scores),
+            "n_cpe":   n_cpe,
+            "n_spe":   len(scores) - n_cpe,
+            "cpe_pct": round(n_cpe / len(scores) * 100, 2),
+            "median":  round(statistics.median(scores), 1),
+            "p95":     round(sorted(scores)[int(len(scores) * 0.95)], 1),
+        }
+
 
 class CPEInterleaveSampler(Sampler):
     def __init__(self, dataset: LaTeXDataset, batch_size: int, cpe_ratio: float, seed: int = 42):
@@ -88,6 +120,7 @@ class CPEInterleaveSampler(Sampler):
             rng.shuffle(batch_idx)
             yield batch_idx
 
+
 def collate_fn(batch: list[dict], pad_token_id: int = 1) -> dict:
     max_len = max(item["input_ids"].size(0) for item in batch)
 
@@ -109,14 +142,16 @@ def collate_fn(batch: list[dict], pad_token_id: int = 1) -> dict:
         "input_ids":      torch.stack(input_ids_list),
         "labels":         torch.stack(labels_list),
         "attention_mask": torch.stack(mask_list),
+        "true_len":       torch.stack([item["true_len"] for item in batch]),
     }
+
 
 def build_dataloader(config, split: str = "train") -> DataLoader:
     dataset = LaTeXDataset(config)
     pw = getattr(config, "persistent_workers", False) and config.num_workers > 0
     pf = getattr(config, "prefetch_factor", 2) if config.num_workers > 0 else None
 
-    if split == "train" and hasattr(config, "cpe_ratio") and config.cpe_ratio > 0:
+    if split == "train" and getattr(config, "cpe_ratio", 0) > 0:
         sampler = CPEInterleaveSampler(
             dataset,
             batch_size=config.batch_size,
