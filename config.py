@@ -2,8 +2,8 @@ import argparse
 from pathlib import Path
 
 _DEFAULT_TOKENIZER_DIR = str(Path(__file__).parent / "tokenizer")
-_DEFAULT_DATA_GLOB     = r"D:\dataset-ocr-builder\latex-ocr-dataset\ocr-data-dedup\train\raw\*.parquet"
-_DEFAULT_SAVE_DIR      = str(Path(__file__).parent / "checkpoints")
+_DEFAULT_DATA_GLOB     = "/workspace/data/*.parquet"
+_DEFAULT_SAVE_DIR      = "/workspace/checkpoints"
 
 
 def get_config():
@@ -53,8 +53,8 @@ def get_config():
     p.add_argument("--prefetch-factor",    type=int,            default=2)
     p.add_argument("--persistent-workers", action="store_true", default=False)
     p.add_argument("--cuda-benchmark",     action="store_true", default=False)
-    p.add_argument("--fp16",               action="store_true", default=True)
-    p.add_argument("--no-fp16",            action="store_false", dest="fp16")
+    p.add_argument("--bf16",               action="store_true", default=True)
+    p.add_argument("--no-bf16",            action="store_false", dest="bf16")
     p.add_argument("--compile",            action="store_true", default=False)
     p.add_argument("--flash-attn",         action="store_true", default=False)
 

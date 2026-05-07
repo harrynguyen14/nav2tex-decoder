@@ -140,7 +140,7 @@ def train():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if config.cuda_benchmark and device.type == "cuda":
         torch.backends.cudnn.benchmark = True
-    print(f"device={device}  fp16={config.fp16}  cudnn_benchmark={config.cuda_benchmark}")
+    print(f"device={device}  bf16={config.bf16}  cudnn_benchmark={config.cuda_benchmark}")
 
     loader = build_dataloader(config, split="train")
 
@@ -161,7 +161,8 @@ def train():
 
     optimizer = _make_optimizer(model, config)
     scheduler = _make_scheduler(optimizer, config, total_steps)
-    scaler    = torch.cuda.amp.GradScaler(enabled=(config.fp16 and device.type == "cuda"))
+    use_bf16  = config.bf16 and device.type == "cuda"
+    amp_ctx   = torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_bf16)
 
     start_step = 0
     latest = _find_latest_checkpoint(save_dir)
@@ -207,7 +208,7 @@ def train():
             true_len       = batch["true_len"].to(device)
             batch_tokens  += attention_mask.sum().item()
 
-            with torch.cuda.amp.autocast(enabled=(config.fp16 and device.type == "cuda")):
+            with amp_ctx:
                 _sdp_backends = (
                     [SDPBackend.FLASH_ATTENTION]
                     if config.flash_attn
@@ -227,15 +228,13 @@ def train():
                     )
                     loss = loss / config.grad_accum
 
-            scaler.scale(loss).backward()
+            loss.backward()
             accum_loss     += loss.item()
             accum_lm_loss  += lm_loss.item() / config.grad_accum
             accum_len_loss += len_loss.item() / config.grad_accum
 
-        scaler.unscale_(optimizer)
         grad_norm = nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm).item()
-        scaler.step(optimizer)
-        scaler.update()
+        optimizer.step()
         scheduler.step()
 
         step             += 1
